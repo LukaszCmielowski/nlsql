@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dch-nlsql-sample"
+version = "0.1.0"
+description = "Natural-language SQL with Data Connect Hub execution"
+requires-python = ">=3.11"
+dependencies = [
+  "data-connect-hub[flight] @ git+https://github.com/opendatahub-io/data-connect-hub.git@6d58bc9975a431c8f8a9040e610520d20c980f36#subdirectory=sdk/python",
+  "openai>=2.54,<3",
+  "langgraph>=1,<2",
+  "python-dotenv>=1,<2",
+  "sqlglot>=28,<29",
+]
+
+[project.scripts]
+dch-nlsql = "nlsql.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["nlsql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

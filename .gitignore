@@ -1,0 +1,12 @@
+.venv/
+.env
+.env.*
+!.env.example
+.idea/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+kubeconfig*
+*.token
+*.pem

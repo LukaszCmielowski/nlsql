@@ -1,0 +1,29 @@
+This is a fictional electronics shop. Use only the nlsql_demo schema.
+
+Tables and relationships:
+- nlsql_demo.customers: one row per customer. Primary key: customer_id.
+  customer_name is the person's display name; country contains full country names.
+- nlsql_demo.orders: one row per order. Primary key: order_id.
+  orders.customer_id references customers.customer_id.
+  ordered_on is the order date. status is completed, pending, or cancelled.
+- nlsql_demo.order_items: one row per order line. Primary key: (order_id, line_number).
+  order_items.order_id references orders.order_id.
+  Each line has a product_name, category, quantity, and unit_price.
+
+Business rules:
+- All monetary values are USD. Revenue is SUM(quantity * unit_price) for completed orders only.
+- Pending and cancelled orders do not contribute to revenue or units sold.
+- Customer spending means revenue from that customer's completed orders.
+- Count orders from the order headers; after joining lines, use COUNT(DISTINCT order_id).
+- Include customers with no orders when asked about all customers or customers who never ordered.
+- No tax, discounts, shipping charges, or exchange rates are modeled.
+- The fixed demo dates cover January through April 2026; do not assume the data is current.
+
+Examples of useful questions:
+- What is total completed revenue?
+- Which three customers spent the most?
+- What was completed revenue by country?
+- Show completed revenue by month for January through April 2026.
+- Which products sold the most units in completed orders?
+- Which customers have never placed an order?
+- How many orders are pending or cancelled?
