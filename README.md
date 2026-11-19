@@ -4,6 +4,8 @@ Ask a question, generate SQL with an OpenAI-compatible model, and query your dat
 
 Schema discovery and query execution go through the DCH Python SDK. The model receives the selected schema and business descriptions. Results are printed locally with the SQL that produced them. Demo data is seeded separately, directly in PostgreSQL.
 
+![Terminal demo showing a completed-order revenue question, query progress, the result of 5,510, and the generated SQL](nlsql-demo.gif)
+
 ## Quick start
 
 Run commands from the repository directory. You need:
