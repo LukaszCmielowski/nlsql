@@ -87,6 +87,41 @@ def test_supported_dialects(dialect):
     assert validate("SELECT COUNT(*) FROM orders", dialect=dialect).endswith("LIMIT 25")
 
 
+@pytest.mark.parametrize("dialect", ["sqlite", "duckdb"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'SELECT "OrderID" FROM "Sales"."OrderItems"',
+        "SELECT OrderItems.OrderID FROM OrderItems",
+    ],
+)
+def test_case_insensitive_dialects_resolve_mixed_case_catalog_names(dialect, sql):
+    tables = [TableSchema("OrderItems", "Sales", (("OrderID", "int64"),))]
+    validated = validate(sql, tables=tables, dialect=dialect)
+    assert '"Sales"."OrderItems"' in validated
+    assert validate(validated, tables=tables, dialect=dialect) == validated
+
+
+def test_postgres_keeps_quoted_mixed_case_columns_distinct():
+    tables = [TableSchema("orders", "public", (("OrderID", "int64"),))]
+    assert 'SELECT "OrderID"' in validate('SELECT "OrderID" FROM orders', tables=tables)
+    with pytest.raises(ColumnValidationError):
+        validate("SELECT OrderID FROM orders", tables=tables)
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "duckdb"])
+def test_case_insensitive_dialects_preserve_non_ascii_identifier_distinctions(dialect):
+    tables = [
+        TableSchema("Événements", "main", (("État", "string"),)),
+        TableSchema("événements", "main", (("état", "string"),)),
+    ]
+    sql = validate('SELECT "ÉTAT" FROM "ÉVéNEMENTS"', tables=tables, dialect=dialect)
+    assert '"main"."Événements"' in sql
+    assert '"État"' in sql
+    with pytest.raises(ColumnValidationError):
+        validate('SELECT "état" FROM "Événements"', tables=tables, dialect=dialect)
+
+
 @pytest.mark.parametrize(
     "sql",
     [

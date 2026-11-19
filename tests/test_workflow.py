@@ -76,7 +76,6 @@ def test_dry_run_inspects_and_plans_without_executing(context):
         "schema",
         "inspect_schema",
         "generate",
-        "validate",
         "check_query",
     ]
     context.dch.read_pandas.assert_not_called()
@@ -240,8 +239,7 @@ def test_progress_follows_workflow_stages_without_extra_requests(context):
         "Discovering database schema through DCH...",
         "Inspecting database types, keys, and descriptions through DCH...",
         "Generating SQL with the model...",
-        "Validating SQL and column names...",
-        "Checking SQL with the database planner through DCH...",
+        "Validating SQL and checking the query plan through DCH...",
         "Running the query through DCH...",
     ]
     context.llm.chat.completions.create.assert_called_once()
@@ -256,10 +254,9 @@ def test_progress_reports_repair_and_revalidation(context):
         response("SELECT amount FROM orders"),
     ]
     run_question("Revenue?", replace(context, on_progress=messages.append))
-    assert messages[-4:] == [
+    assert messages[-3:] == [
         "Correcting SQL with the model...",
-        "Validating SQL and column names...",
-        "Checking SQL with the database planner through DCH...",
+        "Validating SQL and checking the query plan through DCH...",
         "Running the query through DCH...",
     ]
     context.dch.read_pandas.assert_called_once()
@@ -268,8 +265,8 @@ def test_progress_reports_repair_and_revalidation(context):
 def test_dry_run_progress_does_not_report_execution(context):
     messages = []
     run_question("Revenue?", replace(context, dry_run=True, on_progress=messages.append))
-    assert len(messages) == 5
-    assert messages[-1] == "Checking SQL with the database planner through DCH..."
+    assert len(messages) == 4
+    assert messages[-1] == "Validating SQL and checking the query plan through DCH..."
     context.dch.read_pandas.assert_not_called()
 
 

@@ -169,7 +169,7 @@ Commands read `.env` from the current directory. Exported shell variables take p
 | `LLM_MODEL` | Exact model ID, including prefixes and capitalization returned by discovery. |
 | `LLM_API_KEY` | Model API key. Leave empty only for endpoints that allow anonymous access. |
 | `SSL_CERT_FILE` | Optional CA bundle used by the model's HTTP client for private certificates. |
-| `DCH_FLIGHT_TIMEOUT` | Flight request timeout in seconds; default `30`. |
+| `DCH_FLIGHT_TIMEOUT` | Timeout in seconds for Flight discovery RPCs and SQL query/fetch operations. Defaults to `30`. |
 | `LLM_TIMEOUT` | Model request timeout in seconds; default `60`. |
 | `NLSQL_DIALECT` | Default dialect for `schema`, `ask`, and `query`; default `postgres`. |
 | `NLSQL_MAX_ROWS` | Default row limit for `ask` and `query`; default `100`. |
@@ -289,7 +289,7 @@ flowchart TD
     R --> E
 ```
 
-The correction budget is shared across all checks. Unsafe SQL, access failures, and exhausted corrections stop the workflow. A dry run stops after the source planning check, before execution.
+SQLGlot validation and source planning run in one LangGraph step. The correction budget is shared across all checks. Unsafe SQL, access failures, and exhausted corrections stop the workflow. A dry run stops after source planning.
 
 [nlsql/workflow.py](nlsql/workflow.py) defines the LangGraph `StateGraph`. The DCH client, connection, model, dialect, table selection, and limits are fixed outside model-generated state. The model needs chat completions support; no tool calling, embeddings, or vector database is required.
 

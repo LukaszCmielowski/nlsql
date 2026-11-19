@@ -42,8 +42,12 @@ def _query_details(sql: str, dialect: str):
         else None
     )
     numeric = set()
-    for index, expression in enumerate(query.selects):
-        expression = expression.unalias()
+    # An expanded wildcard shifts the positions of the expressions after it.
+    # Keep text values verbatim when their projection cannot be matched.
+    for index, projection in enumerate(query.selects):
+        expression = projection.unalias()
+        if expression.is_star:
+            break
         if isinstance(expression, exp.Window):
             expression = expression.this
         if isinstance(

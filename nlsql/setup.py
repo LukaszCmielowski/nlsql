@@ -10,7 +10,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 from data_connect_hub import (
-    DataConnectClient,
     DCHConnectionError,
     DCHError,
     DCHNotFoundError,
@@ -18,6 +17,7 @@ from data_connect_hub import (
 from openai import APIError, OpenAI
 
 from .connections import create_postgres_connection
+from .dch import DataConnectClient
 from .diagnostics import (
     connection_error_hint,
     dch_error_code,

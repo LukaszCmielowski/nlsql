@@ -14,7 +14,7 @@ from sqlglot.errors import SqlglotError
 
 from .metadata import inspect_tables
 from .schema import TableSchema, discover_tables
-from .service import check_source_sql, draft_sql, run_sql
+from .service import QUERY_CHECK_PROGRESS, check_source_sql, draft_sql, run_sql
 from .validation import CorrectableSQLValidationError, validate_sql
 
 
@@ -124,32 +124,9 @@ def inspect_schema(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     }
 
 
-def validate(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
-    context = runtime.context
-    context.report_progress("Validating SQL and column names...")
-    try:
-        return {
-            "sql": validate_sql(state["sql"], state["tables"], context.dialect, context.max_rows),
-            "error": "",
-        }
-    except CorrectableSQLValidationError as exc:
-        return {"error": str(exc), "feedback": str(exc)}
-    except SqlglotError:
-        return {
-            "error": "Generated SQL failed syntax validation; nothing was executed for this draft.",
-            "feedback": "The SQL could not be parsed. Rewrite one valid SELECT for the supplied dialect and schema.",
-        }
-    except ValueError:
-        # Validation failures stop; no unsafe query is used as an execution probe.
-        return {
-            "error": "Generated SQL failed validation; nothing was executed for this draft.",
-            "feedback": "",
-        }
-
-
 def check_query(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     context = runtime.context
-    context.report_progress("Checking SQL with the database planner through DCH...")
+    context.report_progress(QUERY_CHECK_PROGRESS)
     try:
         return {
             "sql": check_source_sql(
@@ -163,12 +140,25 @@ def check_query(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
             "error": "",
             "feedback": "",
         }
+    except CorrectableSQLValidationError as exc:
+        return {"error": str(exc), "feedback": str(exc)}
+    except SqlglotError:
+        return {
+            "error": "Generated SQL failed syntax validation; nothing was executed for this draft.",
+            "feedback": "The SQL could not be parsed. Rewrite one valid SELECT for the supplied dialect and schema.",
+        }
     except DCHQueryError as exc:
         feedback = correction_feedback(exc)
         return {
             "error": "Database query check failed. "
             + (feedback or "Check source permissions and DCH logs."),
             "feedback": feedback,
+        }
+    except ValueError:
+        # Validation failures stop; no unsafe query is used as an execution probe.
+        return {
+            "error": "Generated SQL failed validation; nothing was executed for this draft.",
+            "feedback": "",
         }
 
 
@@ -213,14 +203,6 @@ def repair(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     return {"sql": sql, "attempts": state["attempts"] + 1, "error": "", "feedback": ""}
 
 
-def after_validation(
-    state: QueryState, runtime: Runtime[QueryContext]
-) -> Literal["check_query", "repair", "end"]:
-    if state.get("error") and state.get("feedback"):
-        return repair_or_end(state, runtime)
-    return "end" if state.get("error") else "check_query"
-
-
 def after_query_check(
     state: QueryState, runtime: Runtime[QueryContext]
 ) -> Literal["execute", "repair", "end"]:
@@ -241,22 +223,18 @@ def build_workflow():
     graph.add_node("schema", load_schema)
     graph.add_node("inspect_schema", inspect_schema)
     graph.add_node("generate", generate)
-    graph.add_node("validate", validate)
     graph.add_node("check_query", check_query)
     graph.add_node("execute", execute)
     graph.add_node("repair", repair)
     graph.add_edge(START, "schema")
     graph.add_edge("schema", "inspect_schema")
     graph.add_edge("inspect_schema", "generate")
-    graph.add_edge("generate", "validate")
-    graph.add_conditional_edges(
-        "validate", after_validation, {"check_query": "check_query", "repair": "repair", "end": END}
-    )
+    graph.add_edge("generate", "check_query")
     graph.add_conditional_edges(
         "check_query", after_query_check, {"execute": "execute", "repair": "repair", "end": END}
     )
     graph.add_conditional_edges("execute", repair_or_end, {"repair": "repair", "end": END})
-    graph.add_edge("repair", "validate")
+    graph.add_edge("repair", "check_query")
     return graph.compile()
 
 

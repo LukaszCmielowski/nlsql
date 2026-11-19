@@ -1,7 +1,8 @@
 """Conservative SQL checks. Database permissions remain the security boundary."""
 
 import sqlglot
-from sqlglot import exp
+from sqlglot import Dialect, exp
+from sqlglot.dialects.dialect import NormalizationStrategy
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify import qualify
@@ -9,6 +10,8 @@ from sqlglot.optimizer.scope import traverse_scope
 from sqlglot.schema import MappingSchema
 
 from .schema import TableSchema
+
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 SAFE_FUNCTIONS = {
     "ABS",
@@ -67,7 +70,20 @@ def validate_sql(sql: str, tables: list[TableSchema], dialect: str, max_rows: in
     statements = sqlglot.parse(sql, read=dialect, error_level=sqlglot.ErrorLevel.RAISE)
     if len(statements) != 1 or not isinstance(statements[0], (exp.Select, exp.SetOperation)):
         raise ValueError("Exactly one SELECT query is required")
-    query = normalize_identifiers(statements[0], dialect=dialect)
+    identifier_dialect = Dialect.get_or_raise(dialect)
+    ascii_insensitive = dialect in {"duckdb", "sqlite"}
+    if ascii_insensitive:
+        # SQLGlot uses Unicode folding here. These engines fold only ASCII.
+        identifier_dialect.normalization_strategy = NormalizationStrategy.CASE_SENSITIVE
+
+    def normalize(expression):
+        if ascii_insensitive:
+            for identifier in expression.find_all(exp.Identifier):
+                identifier.set("this", identifier.name.translate(ASCII_LOWER))
+            return expression
+        return normalize_identifiers(expression, dialect=identifier_dialect)
+
+    query = normalize(statements[0])
     compatibility_errors = []
     forbidden = (exp.DML, exp.DDL, exp.Command, exp.Into, exp.Lock, exp.Copy)
     for node in query.walk():
@@ -89,7 +105,10 @@ def validate_sql(sql: str, tables: list[TableSchema], dialect: str, max_rows: in
                 "Unrecognized cast type. Use native SQL types from the schema, preserving numeric precision."
             )
 
-    allowed = {t.key: t for t in tables}
+    def catalog_name(name: str) -> str:
+        return normalize(exp.to_identifier(name, quoted=True)).name
+
+    allowed = [(tuple(map(catalog_name, table.key)), table) for table in tables]
     physical = set()
     # Scope resolution distinguishes CTE references from physical source tables.
     for scope in traverse_scope(query):
@@ -100,9 +119,7 @@ def validate_sql(sql: str, tables: list[TableSchema], dialect: str, max_rows: in
                 raise ValueError("Table functions and cross-catalog references are not allowed")
             physical.add(id(source))
             key = (source.db, source.name) if source.db else (source.name,)
-            matches = [
-                t for k, t in allowed.items() if k == key or (len(key) == 1 and k[-1] == key[0])
-            ]
+            matches = [t for k, t in allowed if k == key or (len(key) == 1 and k[-1] == key[0])]
             if len(matches) != 1:
                 raise ValueError(f"Unknown or ambiguous table: {source.sql(dialect=dialect)}")
             resolved = matches[0].expression()
@@ -131,16 +148,23 @@ def validate_sql(sql: str, tables: list[TableSchema], dialect: str, max_rows: in
     else:
         row_limit = max_rows
     if tables:
-        schema = MappingSchema(dialect=dialect, normalize=False)
+        schema = MappingSchema(dialect=identifier_dialect, normalize=False)
         for table in tables:
             schema.add_table(
-                table.expression(),
-                column_mapping=dict.fromkeys((name for name, _ in table.columns), "UNKNOWN"),
+                normalize(table.expression()),
+                column_mapping=dict.fromkeys(
+                    (catalog_name(name) for name, _ in table.columns), "UNKNOWN"
+                ),
                 normalize=False,
             )
         try:
             # Check a copy: qualification must not rewrite the submitted SQL.
-            qualify(query.copy(), dialect=dialect, schema=schema, infer_schema=False)
+            qualify(
+                normalize(query.copy()),
+                dialect=identifier_dialect,
+                schema=schema,
+                infer_schema=False,
+            )
         except OptimizeError as exc:
             if compatibility_errors:
                 compatibility_errors.append(f"Schema column check failed: {exc}")

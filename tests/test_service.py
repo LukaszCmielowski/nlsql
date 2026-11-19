@@ -29,6 +29,13 @@ def model_response(sql="SELECT SUM(amount) FROM orders", reason="stop"):
     return llm
 
 
+def test_empty_model_completion_reports_a_clear_error():
+    llm = Mock()
+    llm.chat.completions.create.return_value = SimpleNamespace(choices=[])
+    with pytest.raises(ValueError, match="Model returned no completion choices"):
+        draft_sql(llm, "test-model", "How many orders?", [], "postgres", 10)
+
+
 def test_question_to_dch_with_exact_connection_and_no_rows_in_prompt():
     dch = Mock()
     dch.get_tables.return_value = pa.Table.from_pylist([metadata()])

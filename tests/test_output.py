@@ -62,6 +62,16 @@ def test_text_identifiers_and_markup_are_preserved_literally():
     assert "1,234,567,890" not in output
 
 
+@pytest.mark.parametrize("wildcard", ["*", "items.*"])
+def test_wildcard_does_not_shift_numeric_formatting_onto_text(wildcard):
+    output = render(
+        f"SELECT {wildcard}, amount * 2 AS doubled FROM items",
+        pd.DataFrame({"id": [1], "postal_code": ["001234"], "amount": [10], "doubled": [20]}),
+    )
+    assert "001234" in output
+    assert "1,234" not in output
+
+
 def test_decimal_values_keep_precision_and_scale():
     output = render(
         "SELECT total FROM totals LIMIT 10",

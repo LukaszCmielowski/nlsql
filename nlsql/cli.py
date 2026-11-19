@@ -5,23 +5,20 @@ import sys
 from pathlib import Path
 
 import pyarrow as pa
-from data_connect_hub import (
-    DataConnectClient,
-    DCHError,
-)
+from data_connect_hub import DCHError
 from dotenv import load_dotenv
 from openai import APIError, OpenAI
 from sqlglot.errors import SqlglotError
 
 from .connections import create_postgres_connection
+from .dch import DataConnectClient
 from .diagnostics import error_hint
 from .metadata import inspect_tables
 from .model import model_auth_options
 from .output import print_query_output, query_progress
 from .schema import discover_tables
-from .service import check_source_sql, run_sql
+from .service import QUERY_CHECK_PROGRESS, check_source_sql, run_sql
 from .setup import run_setup
-from .validation import validate_sql
 from .workflow import QueryContext, run_question
 
 
@@ -210,11 +207,9 @@ def main(argv=None):
                 else:
                     progress("Discovering database schema through DCH...")
                     tables = discover_tables(dch, connection_id, args.table)
-                    progress("Validating SQL and column names...")
-                    sql = validate_sql(args.text, tables, args.dialect, args.max_rows)
-                    progress("Checking SQL with the database planner through DCH...")
+                    progress(QUERY_CHECK_PROGRESS)
                     sql = check_source_sql(
-                        dch, connection_id, sql, tables, args.dialect, args.max_rows
+                        dch, connection_id, args.text, tables, args.dialect, args.max_rows
                     )
                     if not args.dry_run:
                         progress("Running the query through DCH...")
