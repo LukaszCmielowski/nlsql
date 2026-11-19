@@ -503,8 +503,8 @@ def test_custom_question_does_not_print_unrelated_revenue_and_next_command_is_us
     command = output.split("Try another question:\n", 1)[1].strip()
     args = shlex.split(command.replace("\\\n", ""))
     assert args[:4] == ["uv", "run", "dch-nlsql", "ask"]
-    assert args.count("--table") == 3
-    assert Path(args[-1]).is_file()
+    assert "--table" not in args and "--context" not in args
+    assert "completed orders" in args[4]
     assert "\\" not in args
 
 

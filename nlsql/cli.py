@@ -15,9 +15,11 @@ from sqlglot.errors import SqlglotError
 
 from .connections import create_postgres_connection
 from .diagnostics import error_hint
+from .metadata import inspect_tables
 from .model import model_auth_options
+from .output import print_query_output, query_progress
 from .schema import discover_tables
-from .service import run_sql
+from .service import check_source_sql, run_sql
 from .setup import run_setup
 from .validation import validate_sql
 from .workflow import QueryContext, run_question
@@ -55,20 +57,20 @@ def build_parser():
         command.add_argument(
             "--table", action="append", help="Exact schema.table label; repeatable"
         )
+        command.add_argument(
+            "--dialect",
+            default=os.getenv("NLSQL_DIALECT", "postgres"),
+            choices=["postgres", "sqlite", "duckdb"],
+        )
         if name != "schema":
             command.add_argument(
                 "text", help="Natural-language question" if name == "ask" else "SQL"
-            )
-            command.add_argument(
-                "--dialect",
-                default=os.getenv("NLSQL_DIALECT", "postgres"),
-                choices=["postgres", "sqlite", "duckdb"],
             )
             command.add_argument("--max-rows", type=int, default=os.getenv("NLSQL_MAX_ROWS", "100"))
             command.add_argument(
                 "--dry-run",
                 action="store_true",
-                help="Discover schema and validate; skip execution",
+                help="Inspect schema and check the query plan; skip SELECT execution",
             )
         if name == "ask":
             command.add_argument(
@@ -76,7 +78,7 @@ def build_parser():
                 type=int,
                 choices=[0, 1],
                 default=1,
-                help="SQL correction attempts after a recognized source query error (default: 1)",
+                help="SQL correction attempts after validation or source query errors (default: 1)",
             )
             command.add_argument(
                 "--context", type=Path, help="Optional business descriptions (UTF-8 text)"
@@ -167,46 +169,67 @@ def main(argv=None):
                 return 0
             connection_id = args.connection_id or required("DCH_CONNECTION_ID")
             if args.command == "schema":
-                tables = discover_tables(dch, connection_id, args.table)
+                tables = inspect_tables(
+                    dch,
+                    connection_id,
+                    discover_tables(dch, connection_id, args.table),
+                    args.dialect,
+                )
                 print(json.dumps([t.prompt_dict() for t in tables], indent=2))
                 return 0
-            if args.command == "ask":
-                with OpenAI(
-                    base_url=required("LLM_BASE_URL"),
-                    **model_auth_options(os.getenv("LLM_API_KEY", "")),
-                    timeout=float(os.getenv("LLM_TIMEOUT", "60")),
-                    max_retries=0,
-                ) as llm:
-                    outcome = run_question(
-                        args.text,
-                        QueryContext(
-                            dch=dch,
-                            llm=llm,
-                            model=required("LLM_MODEL"),
-                            connection_id=connection_id,
-                            dialect=args.dialect,
-                            max_rows=args.max_rows,
-                            selected_tables=tuple(args.table or ()),
-                            business_context=args.context.read_text(encoding="utf-8")
-                            if args.context
-                            else "",
-                            dry_run=args.dry_run,
-                            max_corrections=args.max_corrections,
-                        ),
+            frame, corrected = None, False
+            with query_progress() as progress:
+                if args.command == "ask":
+                    with OpenAI(
+                        base_url=required("LLM_BASE_URL"),
+                        **model_auth_options(os.getenv("LLM_API_KEY", "")),
+                        timeout=float(os.getenv("LLM_TIMEOUT", "60")),
+                        max_retries=0,
+                    ) as llm:
+                        outcome = run_question(
+                            args.text,
+                            QueryContext(
+                                dch=dch,
+                                llm=llm,
+                                model=required("LLM_MODEL"),
+                                connection_id=connection_id,
+                                dialect=args.dialect,
+                                max_rows=args.max_rows,
+                                selected_tables=tuple(args.table or ()),
+                                business_context=args.context.read_text(encoding="utf-8")
+                                if args.context
+                                else "",
+                                dry_run=args.dry_run,
+                                max_corrections=args.max_corrections,
+                                on_progress=progress,
+                            ),
+                        )
+                    sql = outcome["sql"]
+                    frame = outcome.get("result")
+                    corrected = outcome["attempts"] > 1
+                else:
+                    progress("Discovering database schema through DCH...")
+                    tables = discover_tables(dch, connection_id, args.table)
+                    progress("Validating SQL and column names...")
+                    sql = validate_sql(args.text, tables, args.dialect, args.max_rows)
+                    progress("Checking SQL with the database planner through DCH...")
+                    sql = check_source_sql(
+                        dch, connection_id, sql, tables, args.dialect, args.max_rows
                     )
-                sql = outcome["sql"]
-                frame = outcome.get("result")
-                if outcome["attempts"] > 1:
-                    print("SQL corrected once after a source query error.", flush=True)
-            else:
-                tables = discover_tables(dch, connection_id, args.table)
-                sql = validate_sql(args.text, tables, args.dialect, args.max_rows)
-                if not args.dry_run:
-                    _, frame = run_sql(dch, connection_id, sql, tables, args.dialect, args.max_rows)
-            print(f"SQL ({connection_id}):\n{sql}", flush=True)
-            if not args.dry_run:
-                print(frame.to_string(index=False))
-                print(f"\n{len(frame)} row(s); result limit {args.max_rows}.")
+                    if not args.dry_run:
+                        progress("Running the query through DCH...")
+                        _, frame = run_sql(
+                            dch, connection_id, sql, tables, args.dialect, args.max_rows
+                        )
+            print_query_output(
+                sql,
+                frame,
+                connection_id=connection_id,
+                dialect=args.dialect,
+                max_rows=args.max_rows,
+                question=args.text if args.command == "ask" else None,
+                corrected=corrected,
+            )
         return 0
     except (DCHError, APIError, OSError, ValueError, SqlglotError, pa.ArrowException) as exc:
         print(error_hint(exc), file=sys.stderr)

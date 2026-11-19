@@ -1,6 +1,6 @@
 # Natural-language SQL through Data Connect Hub
 
-Ask a question, generate SQL with an OpenAI-compatible model, and query your database through **Data Connect Hub (DCH)**. **LangGraph** coordinates schema discovery, SQL generation, validation, execution, and one optional correction.
+Ask a question, generate SQL with an OpenAI-compatible model, and query your database through **Data Connect Hub (DCH)**. **LangGraph** coordinates table discovery, schema inspection, SQL generation, validation, database planning, execution, and one optional correction.
 
 Schema discovery and query execution go through the DCH Python SDK. The model receives the selected schema and business descriptions. Results are printed locally with the SQL that produced them. Demo data is seeded separately, directly in PostgreSQL.
 
@@ -61,14 +61,14 @@ The wizard can register a persistent DCH connection and its credential Secret. I
 Once setup succeeds:
 
 ```sh
-uv run dch-nlsql ask 'What is total completed revenue?' \
-  --table nlsql_demo.customers --table nlsql_demo.orders \
-  --table nlsql_demo.order_items --context examples/demo_context.txt
+uv run dch-nlsql ask 'What is total revenue from completed orders?'
 ```
 
 For unmodified demo data, the answer is **USD 5,510.00**. Generated SQL and column aliases may vary.
 
-Keep the [demo business context](examples/demo_context.txt) when asking business questions: column metadata alone does not explain which order statuses count toward revenue.
+Table lists and context files are optional. The graph discovers tables through DCH, then retrieves PostgreSQL native types, primary/foreign keys, and table/column comments through the same connection. For example, it discovers `unit_price` as `numeric(10,2)` and the join path from customers through orders to order items.
+
+Business definitions can still be ambiguous. Specify “completed orders” or “all orders” in the question when that matters. An optional [business context file](examples/demo_context.txt) supplies organization-specific rules that are not documented in the database; it is not required for schema discovery or valid joins.
 
 | Demo table | Rows | Purpose |
 | --- | ---: | --- |
@@ -76,14 +76,35 @@ Keep the [demo business context](examples/demo_context.txt) when asking business
 | `nlsql_demo.orders` | 12 | Order headers, dates, and completed/pending/cancelled statuses. |
 | `nlsql_demo.order_items` | 24 | Products, quantities, and unit prices in USD. |
 
-Other questions to try with the same table and context options:
+Other questions to try without extra options:
 
-- “Which three customers spent the most?”
+- “Which three customers spent the most on completed orders? Show total spending.”
+- “Which three customers spent the least across all orders? Show total spending.”
 - “Which customers have never placed an order?” — Sofia Rossi in the unmodified demo.
 - “Show completed revenue by country.”
 - “Show completed revenue by month for January through April 2026.”
 
 The demo dates are fixed; they do not represent current sales.
+
+### Reading answers
+
+Answers show the question and results first, followed by formatted SQL and the connection ID. Column headings use readable labels, numbers are aligned and grouped, and missing values appear as `NULL`. For example, a top-customer query over completed orders produces:
+
+```text
+Results
+╭───────────────┬─────────────╮
+│ Customer name │ Total spent │
+├───────────────┼─────────────┤
+│ Jordan Lee    │       2,700 │
+│ Jan Kowalski  │       1,260 │
+│ Lena Fischer  │         730 │
+╰───────────────┴─────────────╯
+3 rows returned · query limit 3
+```
+
+The footer shows the SQL query's actual limit, which may be lower than `--max-rows`. Formatting preserves decimal precision and text identifiers; it does not infer currency or request a model summary. Terminal colors are omitted when output is redirected.
+
+While waiting, an animated spinner shows the current stage: schema discovery and inspection, SQL generation, validation, database planning, execution, or correction. It clears before results or errors are printed, including on interruption. The spinner is disabled when output is redirected. This applies to `ask`, `query`, and the setup wizard's question step.
 
 ## Commands
 
@@ -100,8 +121,7 @@ The demo dates are fixed; they do not represent current sales.
 ```sh
 # Inspect connections and the demo schema.
 uv run dch-nlsql connections
-uv run dch-nlsql schema --table nlsql_demo.customers \
-  --table nlsql_demo.orders --table nlsql_demo.order_items
+uv run dch-nlsql schema
 
 # Verify SQL execution without a model.
 uv run dch-nlsql query 'SELECT COUNT(*) AS customers FROM nlsql_demo.customers'
@@ -111,16 +131,16 @@ uv run dch-nlsql ask 'How many customers are there?' \
   --table nlsql_demo.customers --dry-run
 ```
 
-`--dry-run` still retrieves live metadata and, for `ask`, calls the model. It skips SQL execution.
+`--dry-run` still retrieves live metadata and, for `ask`, calls the model. PostgreSQL schema inspection uses fixed read-only catalog queries. The draft is checked with `EXPLAIN` (never `EXPLAIN ANALYZE`); the generated SELECT itself is not executed.
 
 | Option | Applies to | Behavior |
 | --- | --- | --- |
 | `--connection-id ID` | `schema`, `query`, `ask` | Overrides `DCH_CONNECTION_ID`. |
 | `--table schema.table` | `schema`, `query`, `ask` | Repeat to restrict included tables; for queries it also restricts permitted source tables. Without it, all tables returned by DCH are included. |
 | `--context FILE` | `ask` | Adds UTF-8 business descriptions appropriate for the selected connection. |
-| `--dialect NAME` | `query`, `ask` | `postgres`, `sqlite`, or `duckdb`; match the source's dialect. |
+| `--dialect NAME` | `schema`, `query`, `ask` | `postgres`, `sqlite`, or `duckdb`; match the source's dialect. |
 | `--max-rows N` | `query`, `ask` | Limits returned rows; default 100, maximum 10,000. |
-| `--dry-run` | `query`, `ask` | Validates without SQL execution. |
+| `--dry-run` | `query`, `ask` | Validates and plans without executing the generated SELECT. |
 | `--max-corrections 0` | `ask` | Disables the default single SQL correction attempt. |
 
 The wizard and demo target PostgreSQL. One question queries one connection; there is no federation across connections. Use `uv run dch-nlsql COMMAND --help` for command options. `uv run python main.py ...` provides the same CLI.
@@ -151,7 +171,7 @@ Commands read `.env` from the current directory. Exported shell variables take p
 | `SSL_CERT_FILE` | Optional CA bundle used by the model's HTTP client for private certificates. |
 | `DCH_FLIGHT_TIMEOUT` | Flight request timeout in seconds; default `30`. |
 | `LLM_TIMEOUT` | Model request timeout in seconds; default `60`. |
-| `NLSQL_DIALECT` | Default dialect for `ask` and `query`; default `postgres`. |
+| `NLSQL_DIALECT` | Default dialect for `schema`, `ask`, and `query`; default `postgres`. |
 | `NLSQL_MAX_ROWS` | Default row limit for `ask` and `query`; default `100`. |
 
 Keep optional values empty, for example `LLM_API_KEY=` or `DCH_CA_CERT=`. When `LLM_API_KEY` is empty, the client omits the Authorization header and does not fall back to `OPENAI_API_KEY`. Model credentials, DCH tokens, and PostgreSQL credentials serve different purposes.
@@ -221,11 +241,12 @@ The demo seed does not create roles or grant permissions automatically.
 | DCH TLS verification fails | Configure `DCH_CA_CERT` with the trusted gateway CA. Use the gateway hostname matching its certificate. |
 | DCH authentication or tenant access fails | Refresh `DCH_TOKEN` if expired and confirm access to `DCH_TENANT_ID`. |
 | Readiness returns HTTP 502 / `connection_check_failed` | Check source connectivity and Flight's access to the saved credential Secret. See below. |
+| Schema discovery fails while the connection is marked ready | Readiness is saved REST status; a live Flight check can still fail. Retry database checks for an interruption or unavailable service. For persistent errors, check the reported Flight error category, gateway routing, and Flight logs. Reuse the saved connection. |
 | Demo tables are missing | Load the seed into the same database selected by the DCH connection, then retry setup. |
 | Model returns HTTP 401 or 403 | Verify the real model API key and model permissions. A gateway may reject auth before checking the URL path. |
 | Model returns HTTP 404 | Check the API base URL, gateway prefix, and exact discovered model ID. |
 | Model TLS verification fails | Configure `SSL_CERT_FILE` with a trusted model CA bundle. |
-| SQL fails after correction | Inspect the printed SQL, live `schema` output, and question. Include the demo context for business questions. |
+| SQL fails after correction | Inspect the printed SQL, live `schema` output, and question. Clarify ambiguous business definitions in the question or supply optional context. |
 | Changing `.env` has no effect | Update or unset the corresponding exported shell variable. |
 
 ### DCH gateway certificate
@@ -255,23 +276,53 @@ If access is denied, review and apply the tenant-specific Role and RoleBinding c
 
 ```mermaid
 flowchart TD
-    Q[Question + selected connection] --> S[DCH schema discovery]
-    S --> G[Generate SQL with configured model]
-    G --> V[Validate SQL, columns, and result limit]
-    V -->|Valid| E[Execute through DCH SDK]
-    V -->|Column error, correction available| C[Generate corrected SQL]
-    V -->|Rejected or dry run| Stop[Stop]
-    E -->|Success| R[SQL + result table]
-    E -->|Recognized SQL error, correction available| C
-    C --> V
-    E -->|Other error or correction exhausted| Stop
+    A[Question] --> B[Discover tables through DCH]
+    B --> C[Inspect native types, keys, and comments]
+    C --> D[Model generates SQL]
+    D --> E[SQLGlot validation]
+    E --> F[Source EXPLAIN through DCH]
+    F --> G[Execute through DCH]
+    G --> H[Formatted local results]
+    E -->|Correctable error| R[Repair once]
+    F -->|Correctable error| R
+    G -->|Correctable error| R
+    R --> E
 ```
+
+The correction budget is shared across all checks. Unsafe SQL, access failures, and exhausted corrections stop the workflow. A dry run stops after the source planning check, before execution.
 
 [nlsql/workflow.py](nlsql/workflow.py) defines the LangGraph `StateGraph`. The DCH client, connection, model, dialect, table selection, and limits are fixed outside model-generated state. The model needs chat completions support; no tool calling, embeddings, or vector database is required.
 
-Validation requires one read-only SELECT, resolves physical tables and columns against DCH metadata, rejects writes and functions outside a conservative allowlist, and applies the row limit. The execution boundary validates SQL again. Missing or ambiguous columns and recognized source SQL errors share one correction attempt. Raw DCH exception bodies are never forwarded to the model; corrected SQL must pass validation again.
+The workflow follows the SQL-tool sequence of table discovery, schema inspection, query checking, and execution. The pinned DCH SDK has no dedicated primary/foreign-key methods, so PostgreSQL inspection uses two application-owned catalog SELECTs through `DataConnectClient.read()`, restricted to discovered tables. This retrieves native types, keys (including composite keys), and comments; Arrow transport strings are not treated as native SQL types. PostgreSQL catalog access is required, and incomplete or inconsistent metadata stops generation with an error. Other dialects currently use Arrow metadata without this PostgreSQL enrichment.
+
+Validation requires one read-only SELECT, resolves physical tables and columns against metadata, rejects writes and functions outside a conservative allowlist, and applies the row limit. A source `EXPLAIN` checks types and expressions before the application query runs. The execution boundary validates SQL again. Parse errors, missing/ambiguous columns, selected unsupported pure functions/casts, and recognized source SQL errors share one correction attempt. Prohibited operations and access/transport failures stop. No rejected draft is used as an execution probe. Raw DCH exception bodies and query plans are never forwarded to the model; corrected SQL must pass every check again.
 
 The question, selected schema, business context, and correction feedback go to the configured model. Tokens and result rows are not added to model prompts. The sample configures no checkpointer, conversation memory, result-summary call, or remote tracing. If you enable framework tracing, review what its destination captures.
+
+### Reused libraries and custom code
+
+| Component | Actual reuse |
+| --- | --- |
+| DCH Python SDK | Connection management, token/tenant handling, Flight table discovery, catalog reads, planning requests, and query execution. The SDK is pinned in `pyproject.toml`. |
+| LangGraph | `StateGraph`, per-query runtime context, and conditional routing for the bounded correction loop. |
+| OpenAI Python SDK | Chat completions and model discovery against the configured compatible endpoint, including MaaS. |
+| SQLGlot | SQL parsing, scope/column resolution, identifier handling, row-limit rewriting, and SQL formatting. Validation policy is application code. |
+| PyArrow and pandas | Flight schema decoding and query result containers, supplied through DCH's Flight dependencies. |
+| Rich | Terminal tables, SQL highlighting, and transient progress spinners. |
+| python-dotenv | Loading and saving local configuration. |
+
+The DCH metadata adapter, PostgreSQL catalog queries, reference DDL, generation prompts, validation policy, source `EXPLAIN` check, correction routing, CLI/setup wizard, and demo data are custom code in this repository. The model generates SQL; LangGraph controls the sequence of operations.
+
+`langchain-ibm` and `ibm-watsonx-ai` were consulted for their table/schema/check/query workflow and extended-metadata representation. They are design references only: their SQL toolkit and Flight client are not runtime dependencies, and no source code from either package is copied or vendored here. Their Flight discovery uses watsonx-specific commands and connection assets; this implementation retains DCH's SDK and connection model.
+
+| Code | Responsibility |
+| --- | --- |
+| [workflow.py](nlsql/workflow.py) | LangGraph nodes, trusted query context, progress events, and correction routing. |
+| [schema.py](nlsql/schema.py), [metadata.py](nlsql/metadata.py) | DCH discovery, PostgreSQL native metadata, keys/comments, and reference DDL. |
+| [service.py](nlsql/service.py), [validation.py](nlsql/validation.py) | Model requests, local SQL checks, source planning, and DCH execution. |
+| [cli.py](nlsql/cli.py), [setup.py](nlsql/setup.py), [setup_ui.py](nlsql/setup_ui.py) | Commands and guided configuration. |
+| [connections.py](nlsql/connections.py), [model.py](nlsql/model.py), [diagnostics.py](nlsql/diagnostics.py) | Connection lifecycle, model authentication/discovery, and safe diagnostics. |
+| [output.py](nlsql/output.py) | Result presentation and progress spinners. |
 
 ### Scope and limits
 

@@ -32,6 +32,26 @@ def context():
         ]
     )
     dch.read_pandas.return_value = pd.DataFrame({"total": [42.0]})
+
+    def metadata(sql, connection_id):
+        if "FROM pg_catalog.pg_attribute AS a" in sql:
+            return pa.Table.from_pylist(
+                [
+                    {
+                        "table_schema": "public",
+                        "table_name": "orders",
+                        "column_name": name,
+                        "data_type": kind,
+                        "is_nullable": False,
+                        "column_description": None,
+                        "table_description": None,
+                    }
+                    for name, kind in (("id", "bigint"), ("amount", "numeric"))
+                ]
+            )
+        return pa.Table.from_pylist([])
+
+    dch.read.side_effect = metadata
     llm = Mock()
     llm.chat.completions.create.return_value = response("SELECT SUM(amount) AS total FROM orders")
     return QueryContext(dch=dch, llm=llm, model="test-model", connection_id="conn-a", max_rows=10)
@@ -48,11 +68,17 @@ def test_real_graph_success_and_exact_connection(context):
     assert "42.0" not in json.dumps(context.llm.chat.completions.create.call_args.kwargs)
 
 
-def test_dry_run_visits_schema_generation_validation_only(context):
+def test_dry_run_inspects_and_plans_without_executing(context):
     events = list(
         build_workflow().stream({"question": "Total?"}, context=replace(context, dry_run=True))
     )
-    assert [next(iter(event)) for event in events] == ["schema", "generate", "validate"]
+    assert [next(iter(event)) for event in events] == [
+        "schema",
+        "inspect_schema",
+        "generate",
+        "validate",
+        "check_query",
+    ]
     context.dch.read_pandas.assert_not_called()
 
 
@@ -170,7 +196,7 @@ def test_invalid_initial_generation_never_executes(context, sql):
     with pytest.raises(QueryWorkflowError, match="validation"):
         run_question("Revenue?", context)
     context.dch.read_pandas.assert_not_called()
-    context.llm.chat.completions.create.assert_called_once()
+    assert context.llm.chat.completions.create.call_count == (2 if sql.startswith("Here is") else 1)
 
 
 def test_unsafe_repair_never_executes(context):
@@ -205,6 +231,174 @@ def test_empty_question_stops_before_network_calls(context):
         run_question(" ", context)
     context.dch.get_tables.assert_not_called()
     context.llm.chat.completions.create.assert_not_called()
+
+
+def test_progress_follows_workflow_stages_without_extra_requests(context):
+    messages = []
+    result = run_question("Revenue?", replace(context, on_progress=messages.append))
+    assert messages == [
+        "Discovering database schema through DCH...",
+        "Inspecting database types, keys, and descriptions through DCH...",
+        "Generating SQL with the model...",
+        "Validating SQL and column names...",
+        "Checking SQL with the database planner through DCH...",
+        "Running the query through DCH...",
+    ]
+    context.llm.chat.completions.create.assert_called_once()
+    context.dch.read_pandas.assert_called_once()
+    assert "on_progress" not in result
+
+
+def test_progress_reports_repair_and_revalidation(context):
+    messages = []
+    context.llm.chat.completions.create.side_effect = [
+        response("SELECT missing FROM orders"),
+        response("SELECT amount FROM orders"),
+    ]
+    run_question("Revenue?", replace(context, on_progress=messages.append))
+    assert messages[-4:] == [
+        "Correcting SQL with the model...",
+        "Validating SQL and column names...",
+        "Checking SQL with the database planner through DCH...",
+        "Running the query through DCH...",
+    ]
+    context.dch.read_pandas.assert_called_once()
+
+
+def test_dry_run_progress_does_not_report_execution(context):
+    messages = []
+    run_question("Revenue?", replace(context, dry_run=True, on_progress=messages.append))
+    assert len(messages) == 5
+    assert messages[-1] == "Checking SQL with the database planner through DCH..."
+    context.dch.read_pandas.assert_not_called()
+
+
+def test_planner_failure_is_repaired_before_any_application_query_executes(context):
+    original_read = context.dch.read.side_effect
+    plans = []
+
+    def read(sql, connection):
+        if sql.startswith("EXPLAIN "):
+            plans.append(sql)
+            if len(plans) == 1:
+                raise DCHQueryError("function bad_type(private-password) does not exist")
+        return original_read(sql, connection)
+
+    context.dch.read.side_effect = read
+    result = run_question("Revenue?", context)
+    assert result["attempts"] == 2 and len(plans) == 2
+    assert all("ANALYZE" not in sql for sql in plans)
+    context.dch.read_pandas.assert_called_once()
+    assert "private-password" not in json.dumps(
+        context.llm.chat.completions.create.call_args.kwargs
+    )
+
+
+def test_planner_permission_failure_stops_without_execution_or_repair(context):
+    original_read = context.dch.read.side_effect
+
+    def read(sql, connection):
+        if sql.startswith("EXPLAIN "):
+            raise DCHQueryError("permission denied private-password")
+        return original_read(sql, connection)
+
+    context.dch.read.side_effect = read
+    with pytest.raises(QueryWorkflowError, match="query check failed") as caught:
+        run_question("Revenue?", context)
+    assert "private-password" not in str(caught.value)
+    context.dch.read_pandas.assert_not_called()
+    context.llm.chat.completions.create.assert_called_once()
+
+
+def test_original_invented_price_parsing_and_join_are_repaired_from_live_schema(context):
+    definitions = {
+        "customers": (("customer_id", "integer"), ("customer_name", "text")),
+        "orders": (("order_id", "integer"), ("customer_id", "integer")),
+        "order_items": (
+            ("order_id", "integer"),
+            ("quantity", "integer"),
+            ("unit_price", "numeric(10,2)"),
+        ),
+    }
+    context.dch.get_tables.return_value = pa.Table.from_pylist(
+        [
+            {
+                "table_name": name,
+                "db_schema_name": "nlsql_demo",
+                "table_schema": pa.schema([(column, pa.string()) for column, _ in columns])
+                .serialize()
+                .to_pybytes(),
+            }
+            for name, columns in definitions.items()
+        ]
+    )
+
+    def metadata(sql, connection):
+        if "FROM pg_catalog.pg_attribute AS a" in sql:
+            return pa.Table.from_pylist(
+                [
+                    {
+                        "table_schema": "nlsql_demo",
+                        "table_name": name,
+                        "column_name": column,
+                        "data_type": kind,
+                        "is_nullable": False,
+                        "column_description": None,
+                        "table_description": None,
+                    }
+                    for name, columns in definitions.items()
+                    for column, kind in columns
+                ]
+            )
+        if "FROM pg_catalog.pg_constraint AS con" in sql:
+            return pa.Table.from_pylist(
+                [
+                    {
+                        "table_schema": "nlsql_demo",
+                        "table_name": source,
+                        "constraint_name": source + "_fk",
+                        "constraint_type": "f",
+                        "position": 1,
+                        "column_name": column,
+                        "referenced_schema": "nlsql_demo",
+                        "referenced_table": target,
+                        "referenced_column": column,
+                    }
+                    for source, column, target in (
+                        ("orders", "customer_id", "customers"),
+                        ("order_items", "order_id", "orders"),
+                    )
+                ]
+            )
+        assert sql.startswith("EXPLAIN SELECT") and "SPLIT_PART" not in sql
+        return pa.Table.from_pylist([])
+
+    context.dch.read.side_effect = metadata
+    context.llm.chat.completions.create.side_effect = [
+        response("""
+        SELECT c.customer_name FROM nlsql_demo.customers c JOIN (
+          SELECT customer_id, SUM(CAST(REPLACE(SPLIT_PART(unit_price, ',', 1), '$', '') AS int32)) AS total_spent
+          FROM nlsql_demo.order_items GROUP BY customer_id
+        ) oi ON c.customer_id = oi.customer_id ORDER BY total_spent ASC LIMIT 3
+    """),
+        response("""
+        SELECT c.customer_name, SUM(i.quantity * i.unit_price) AS total_spent
+        FROM nlsql_demo.customers c JOIN nlsql_demo.orders o ON c.customer_id = o.customer_id
+        JOIN nlsql_demo.order_items i ON o.order_id = i.order_id
+        GROUP BY c.customer_id, c.customer_name ORDER BY total_spent ASC NULLS LAST LIMIT 3
+    """),
+    ]
+    result = run_question("Which three customers spent the less?", context)
+    assert result["attempts"] == 2
+    context.dch.read_pandas.assert_called_once()
+    payload = json.loads(
+        context.llm.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    )
+    assert payload["business_context"] == ""
+    assert "REPLACE" in payload["correction"]["feedback"]
+    assert "customer_id" in payload["correction"]["feedback"]
+    assert payload["schema"][2]["foreign_keys"]
+    assert dict(result["tables"][2].columns)["unit_price"] == "numeric(10,2)"
 
 
 def test_cli_ask_executes_graph_result_exactly_once(context, monkeypatch, capsys):

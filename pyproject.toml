@@ -13,6 +13,7 @@ dependencies = [
   "langgraph>=1,<2",
   "python-dotenv>=1,<2",
   "sqlglot>=28,<29",
+  "rich>=14,<15",
 ]
 
 [project.scripts]

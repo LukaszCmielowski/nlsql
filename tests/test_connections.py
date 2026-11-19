@@ -202,9 +202,8 @@ def test_empty_type_name_and_conflicting_selectors_fail_before_network(dch):
     assert not dch.method_calls
 
 
-def test_cli_type_name_overrides_environment_and_old_id(registration_cli, monkeypatch):
+def test_cli_type_name_overrides_environment(registration_cli, monkeypatch):
     monkeypatch.setenv("DCH_CONNECTION_TYPE_NAME", "Different")
-    monkeypatch.setenv("DCH_CONNECTION_TYPE_ID", "stale-id")
     assert cli.main(["create-connection", "--connection-type", "Postgres"]) == 0
     registration_cli.list_connection_types.assert_called_once()
     registration_cli.get_connection_type.assert_not_called()

@@ -24,6 +24,7 @@ from .diagnostics import (
     error_hint,
 )
 from .model import available_models, model_auth_options
+from .output import print_query_output, print_table, query_progress
 from .schema import discover_tables
 from .service import run_sql
 from .setup_ui import Settings, certificate_file, prompt_value, step, yes
@@ -291,7 +292,7 @@ def verify_tables(client, connection, settings: Settings):
                 100,
             )
             print("DCH discovered: " + ", ".join(t.label for t in tables))
-            print(frame.to_string(index=False))
+            print_table(frame)
             print("Database checks passed. An unmodified demo has 6 customers.")
             return True
         except (DCHError, ValueError) as exc:
@@ -308,7 +309,7 @@ def verify_tables(client, connection, settings: Settings):
                 and "credential Secret" in connection_error_hint(exc)
             ):
                 access_help(settings.get("DCH_TENANT_ID"), connection.credentials_ref.secret)
-            if not yes("After fixing this step in another terminal, retry now?"):
+            if not yes("Retry the database checks now?"):
                 return False
 
 
@@ -392,37 +393,45 @@ def run_demo_question(client, connection, settings: Settings):
     ) as llm:
         choose_model(llm, settings)
         step(5, "Ask a question")
+        print("Using the included demo business definitions for this setup check.")
         print("Try the default question, or ask 'Which three customers spent the most?'.")
         question = prompt_value("Question", default=DEFAULT_QUESTION)
-        print("Generating SQL, checking it against the schema, and querying through DCH...")
-        result = run_question(
-            question,
-            QueryContext(
-                dch=client,
-                llm=llm,
-                model=settings.get("LLM_MODEL"),
-                connection_id=connection.id,
-                selected_tables=DEMO_TABLES,
-                business_context=context,
-            ),
-        )
-    print("\nSQL:\n" + result["sql"])
-    if result.get("attempts", 1) > 1:
-        print("The model's SQL was corrected once before completion.")
-    print("\nResult:\n" + result["result"].to_string(index=False))
+        with query_progress() as progress:
+            result = run_question(
+                question,
+                QueryContext(
+                    dch=client,
+                    llm=llm,
+                    model=settings.get("LLM_MODEL"),
+                    connection_id=connection.id,
+                    selected_tables=DEMO_TABLES,
+                    business_context=context,
+                    on_progress=progress,
+                ),
+            )
+    print()
+    print_query_output(
+        result["sql"],
+        result["result"],
+        connection_id=connection.id,
+        question=question,
+        corrected=result.get("attempts", 1) > 1,
+    )
     print("\nEnd-to-end query succeeded.")
     if question == DEFAULT_QUESTION:
         print("Reference for unmodified demo data: completed revenue is USD 5510.00.")
     print("\nTry another question:")
-    command = ["uv", "run", "dch-nlsql", "ask", "Which three customers spent the most?"]
-    print(shlex.join(command) + " \\")
     print(
-        "  "
-        + " ".join(f"--table {name}" for name in DEMO_TABLES)
-        + (" \\" if context_file.is_file() else "")
+        shlex.join(
+            [
+                "uv",
+                "run",
+                "dch-nlsql",
+                "ask",
+                "Which three customers spent the most on completed orders? Show their total spending.",
+            ]
+        )
     )
-    if context_file.is_file():
-        print("  --context " + shlex.quote(str(context_file)))
 
 
 def run_setup(env_file: Path | None = None) -> int:

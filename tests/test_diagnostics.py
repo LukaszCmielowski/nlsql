@@ -12,6 +12,7 @@ from data_connect_hub import (
     DCHServerError,
     DCHValidationError,
 )
+from pyarrow import flight
 
 from nlsql import cli
 from nlsql.diagnostics import (
@@ -51,12 +52,50 @@ def test_safe_actionable_hints(message, expected):
     [
         (ssl.SSLCertVerificationError(1, "verification failure"), "DCH_CA_CERT"),
         (socket.gaierror(-2, "lookup failed"), "DNS lookup failed"),
+        (flight.FlightUnauthenticatedError("private-token"), "Refresh DCH_TOKEN"),
+        (flight.FlightUnauthorizedError("private-token"), "Flight access was denied"),
+        (flight.FlightUnavailableError("private-token"), "Flight is unavailable"),
+        (flight.FlightTimedOutError("private-token"), "timed out"),
+        (flight.FlightInternalError("private-token"), "internal error"),
+        (ConnectionResetError("private-token"), "connection was interrupted"),
     ],
 )
 def test_nested_causes(cause, expected):
     error = DCHConnectionError("transport failed")
     error.__cause__ = cause
-    assert expected in connection_error_hint(error)
+    hint = connection_error_hint(error)
+    assert expected in hint
+    assert "private-token" not in hint
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("Received HTTP2 GOAWAY", "connection was interrupted"),
+        ("gRPC StatusCode.UNAVAILABLE", "Flight is unavailable"),
+        ("server returned no Flight endpoints for CommandGetTables", "no metadata endpoint"),
+        ("Deadline exceeded", "timed out"),
+        ("UNAUTHENTICATED", "Refresh DCH_TOKEN"),
+    ],
+)
+def test_flight_status_text_is_recognized_without_exposing_raw_errors(message, expected):
+    hint = connection_error_hint(DCHConnectionError(message + " private-token"))
+    assert expected in hint and "private-token" not in hint
+
+
+def test_unavailable_with_certificate_cause_keeps_tls_guidance():
+    error = DCHConnectionError("transport failed")
+    error.__cause__ = flight.FlightUnavailableError("certificate verify failed private-token")
+    hint = connection_error_hint(error)
+    assert "DCH_CA_CERT" in hint and "Retry" not in hint
+
+
+def test_unknown_flight_error_includes_cause_type_without_its_message():
+    error = DCHConnectionError("private-token")
+    error.__cause__ = flight.FlightServerError("private-password")
+    hint = connection_error_hint(error)
+    assert "FlightServerError" in hint
+    assert "private-token" not in hint and "private-password" not in hint
 
 
 def test_cli_connection_types_explains_tls_failure_without_secrets(monkeypatch, capsys):

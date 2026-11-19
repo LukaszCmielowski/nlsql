@@ -3,6 +3,7 @@
 import json
 import re
 import warnings
+from contextlib import contextmanager
 
 from .model import model_request_options
 from .validation import validate_sql
@@ -15,6 +16,13 @@ Do not use SELECT INTO, row locking, or data-changing CTEs.
 Use qualified table names from the schema. Limit the result to at most {max_rows} rows.
 Give each joined table an alias and qualify column references with that alias.
 Check every column against its own table; never assume a column exists on both sides of a join.
+Follow supplied foreign keys when joining tables. Include intermediate tables when required.
+Use native database types when supplied. Arrow transport types are not database SQL types.
+Do not invent currency symbols, string encodings, columns, or data-cleaning operations.
+Preserve decimal precision; do not cast monetary values to integers.
+For entity rankings, include the ranking aggregate in SELECT with a descriptive alias.
+Use ascending order for least/lowest and descending order for most/highest, with NULLS LAST.
+Use table/column descriptions for documented business definitions; do not invent unstated filters.
 If the question cannot be answered from this schema, reply CANNOT_ANSWER.
 """
 
@@ -53,6 +61,27 @@ def draft_sql(llm, model, question, tables, dialect, max_rows, business_context=
 
 def run_sql(dch, connection_id, sql, tables, dialect, max_rows):
     validated = validate_sql(sql, tables, dialect, max_rows)
+    with _flight_warnings():
+        return validated, dch.read_pandas(validated, connection_id)
+
+
+def read_metadata(dch, sql, connection_id):
+    """Run application-owned metadata/planning SQL, never arbitrary model SQL."""
+    with _flight_warnings():
+        return dch.read(sql, connection_id)
+
+
+def check_source_sql(dch, connection_id, sql, tables, dialect, max_rows):
+    """Ask the source planner to check validated SQL without running the query."""
+    validated = validate_sql(sql, tables, dialect, max_rows)
+    prefix = "EXPLAIN QUERY PLAN " if dialect == "sqlite" else "EXPLAIN "
+    # Never use EXPLAIN ANALYZE: the generated SELECT must not execute here.
+    read_metadata(dch, prefix + validated, connection_id)
+    return validated
+
+
+@contextmanager
+def _flight_warnings():
     # Flight's driver may lack transactions. These validated SELECTs do not need
     # them; suppress this specific compatibility warning, keeping other warnings.
     with warnings.catch_warnings():
@@ -62,4 +91,4 @@ def run_sql(dch, connection_id, sql, tables, dialect, max_rows):
             category=Warning,
             module=r"^adbc_driver_manager\.dbapi$",
         )
-        return validated, dch.read_pandas(validated, connection_id)
+        yield

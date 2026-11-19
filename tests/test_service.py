@@ -9,7 +9,7 @@ import pytest
 
 from nlsql import cli
 from nlsql.schema import TableSchema, discover_tables
-from nlsql.service import draft_sql, run_sql
+from nlsql.service import check_source_sql, draft_sql, run_sql
 
 
 def metadata(name="orders", namespace="public", raw=True):
@@ -53,6 +53,22 @@ def test_execution_revalidates_before_dch_call(sql):
     dch = Mock()
     with pytest.raises(ValueError):
         run_sql(dch, "connection", sql, [TableSchema("orders", "public", ())], "postgres", 10)
+    dch.read_pandas.assert_not_called()
+
+
+@pytest.mark.parametrize("sql", ["DELETE FROM orders", "SELECT pg_sleep(10)", "SELECT 1; SELECT 2"])
+def test_planner_never_receives_unsafe_sql(sql):
+    dch = Mock()
+    with pytest.raises(ValueError):
+        check_source_sql(dch, "conn", sql, [], "postgres", 10)
+    dch.read.assert_not_called()
+
+
+def test_planner_uses_same_connection_and_never_analyzes_or_executes_select():
+    dch = Mock()
+    sql = check_source_sql(dch, "conn", "SELECT 1", [], "postgres", 10)
+    dch.read.assert_called_once_with("EXPLAIN " + sql, "conn")
+    assert "ANALYZE" not in dch.read.call_args.args[0]
     dch.read_pandas.assert_not_called()
 
 

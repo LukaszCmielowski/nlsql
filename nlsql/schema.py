@@ -7,10 +7,24 @@ from sqlglot import exp
 
 
 @dataclass(frozen=True)
+class ForeignKey:
+    columns: tuple[str, ...]
+    referenced_schema: str
+    referenced_table: str
+    referenced_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class TableSchema:
     name: str
     schema: str
     columns: tuple[tuple[str, str], ...]
+    description: str = ""
+    column_descriptions: tuple[tuple[str, str], ...] = ()
+    nullable_columns: tuple[str, ...] = ()
+    primary_key: tuple[str, ...] = ()
+    foreign_keys: tuple[ForeignKey, ...] = ()
+    type_source: str = "arrow_transport"
 
     @property
     def key(self) -> tuple[str, ...]:
@@ -27,10 +41,54 @@ class TableSchema:
         )
 
     def prompt_dict(self) -> dict:
+        descriptions = dict(self.column_descriptions)
         return {
             "table": self.label,
-            "columns": [{"name": name, "type": kind} for name, kind in self.columns],
+            "type_source": self.type_source,
+            "description": self.description,
+            "columns": [
+                {"name": name, "type": kind, "description": descriptions.get(name, "")}
+                for name, kind in self.columns
+            ],
+            "primary_key": list(self.primary_key),
+            "foreign_keys": [
+                {
+                    "columns": list(key.columns),
+                    "references": f"{key.referenced_schema}.{key.referenced_table}",
+                    "referenced_columns": list(key.referenced_columns),
+                }
+                for key in self.foreign_keys
+            ],
+            "ddl": self.ddl(),
         }
+
+    def ddl(self) -> str:
+        """Reference DDL for prompting; never executed."""
+
+        def identifier(name):
+            return exp.to_identifier(name, quoted=True).sql()
+
+        lines = [
+            f"  {identifier(name)} {kind}"
+            + (
+                " NOT NULL"
+                if self.type_source == "postgresql_catalog" and name not in self.nullable_columns
+                else ""
+            )
+            for name, kind in self.columns
+        ]
+        if self.primary_key:
+            lines.append("  PRIMARY KEY (" + ", ".join(map(identifier, self.primary_key)) + ")")
+        for key in self.foreign_keys:
+            target = ".".join(map(identifier, (key.referenced_schema, key.referenced_table)))
+            lines.append(
+                "  FOREIGN KEY ("
+                + ", ".join(map(identifier, key.columns))
+                + f") REFERENCES {target} ("
+                + ", ".join(map(identifier, key.referenced_columns))
+                + ")"
+            )
+        return f"CREATE TABLE {self.expression().sql()} (\n" + ",\n".join(lines) + "\n);"
 
 
 def discover_tables(client, connection_id: str, selected: list[str] | None = None):

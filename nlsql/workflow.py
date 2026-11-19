@@ -1,6 +1,7 @@
 """Explicit LangGraph SQL workflow with DCH as the only execution backend."""
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
@@ -11,9 +12,10 @@ from langgraph.runtime import Runtime
 from openai import OpenAI
 from sqlglot.errors import SqlglotError
 
+from .metadata import inspect_tables
 from .schema import TableSchema, discover_tables
-from .service import draft_sql, run_sql
-from .validation import ColumnValidationError, validate_sql
+from .service import check_source_sql, draft_sql, run_sql
+from .validation import CorrectableSQLValidationError, validate_sql
 
 
 class QueryState(TypedDict, total=False):
@@ -40,6 +42,11 @@ class QueryContext:
     business_context: str = ""
     dry_run: bool = False
     max_corrections: int = 1
+    on_progress: Callable[[str], None] | None = None
+
+    def report_progress(self, message: str):
+        if self.on_progress is not None:
+            self.on_progress(message)
 
     def __post_init__(self):
         if not self.connection_id.strip() or not self.model.strip():
@@ -73,7 +80,7 @@ def correction_feedback(error: DCHQueryError) -> str:
             "The source could not resolve a table. Check the supplied schema and qualified names.",
         ),
         (
-            r"type mismatch|operator does not exist|cannot cast|binder error|function .*does not exist",
+            r"type mismatch|operator does not exist|cannot cast|binder error|(?:function|type) .*does not exist",
             "The source rejected an expression or type. Check types and supported functions.",
         ),
     ]
@@ -84,6 +91,7 @@ def load_schema(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     if not state["question"].strip():
         raise ValueError("Question must not be empty")
     context = runtime.context
+    context.report_progress("Discovering database schema through DCH...")
     return {
         "tables": discover_tables(
             context.dch, context.connection_id, list(context.selected_tables) or None
@@ -93,6 +101,7 @@ def load_schema(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
 
 def generate(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     context = runtime.context
+    context.report_progress("Generating SQL with the model...")
     sql = draft_sql(
         context.llm,
         context.model,
@@ -105,16 +114,32 @@ def generate(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     return {"sql": sql, "attempts": 1, "error": "", "feedback": ""}
 
 
+def inspect_schema(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
+    context = runtime.context
+    context.report_progress("Inspecting database types, keys, and descriptions through DCH...")
+    return {
+        "tables": inspect_tables(
+            context.dch, context.connection_id, state["tables"], context.dialect
+        )
+    }
+
+
 def validate(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     context = runtime.context
+    context.report_progress("Validating SQL and column names...")
     try:
         return {
             "sql": validate_sql(state["sql"], state["tables"], context.dialect, context.max_rows),
             "error": "",
         }
-    except ColumnValidationError as exc:
+    except CorrectableSQLValidationError as exc:
         return {"error": str(exc), "feedback": str(exc)}
-    except (ValueError, SqlglotError):
+    except SqlglotError:
+        return {
+            "error": "Generated SQL failed syntax validation; nothing was executed for this draft.",
+            "feedback": "The SQL could not be parsed. Rewrite one valid SELECT for the supplied dialect and schema.",
+        }
+    except ValueError:
         # Validation failures stop; no unsafe query is used as an execution probe.
         return {
             "error": "Generated SQL failed validation; nothing was executed for this draft.",
@@ -122,8 +147,34 @@ def validate(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
         }
 
 
+def check_query(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
+    context = runtime.context
+    context.report_progress("Checking SQL with the database planner through DCH...")
+    try:
+        return {
+            "sql": check_source_sql(
+                context.dch,
+                context.connection_id,
+                state["sql"],
+                state["tables"],
+                context.dialect,
+                context.max_rows,
+            ),
+            "error": "",
+            "feedback": "",
+        }
+    except DCHQueryError as exc:
+        feedback = correction_feedback(exc)
+        return {
+            "error": "Database query check failed. "
+            + (feedback or "Check source permissions and DCH logs."),
+            "feedback": feedback,
+        }
+
+
 def execute(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     context = runtime.context
+    context.report_progress("Running the query through DCH...")
     try:
         sql, frame = run_sql(
             context.dch,
@@ -144,6 +195,7 @@ def execute(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
 
 def repair(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
     context = runtime.context
+    context.report_progress("Correcting SQL with the model...")
     sql = draft_sql(
         context.llm,
         context.model,
@@ -163,33 +215,47 @@ def repair(state: QueryState, runtime: Runtime[QueryContext]) -> dict:
 
 def after_validation(
     state: QueryState, runtime: Runtime[QueryContext]
-) -> Literal["execute", "repair", "end"]:
+) -> Literal["check_query", "repair", "end"]:
     if state.get("error") and state.get("feedback"):
-        return after_execution(state, runtime)
-    return "end" if state.get("error") or runtime.context.dry_run else "execute"
+        return repair_or_end(state, runtime)
+    return "end" if state.get("error") else "check_query"
 
 
-def after_execution(state: QueryState, runtime: Runtime[QueryContext]) -> Literal["repair", "end"]:
+def after_query_check(
+    state: QueryState, runtime: Runtime[QueryContext]
+) -> Literal["execute", "repair", "end"]:
+    if state.get("error"):
+        return repair_or_end(state, runtime)
+    return "end" if runtime.context.dry_run else "execute"
+
+
+def repair_or_end(state: QueryState, runtime: Runtime[QueryContext]) -> Literal["repair", "end"]:
     if state.get("feedback") and state["attempts"] <= runtime.context.max_corrections:
         return "repair"
     return "end"
 
 
 def build_workflow():
-    """Compile schema → generation → validation → DCH execution, with one repair edge."""
+    """Compile discovery → inspection → generation → validation → planning → execution."""
     graph = StateGraph(QueryState, context_schema=QueryContext)
     graph.add_node("schema", load_schema)
+    graph.add_node("inspect_schema", inspect_schema)
     graph.add_node("generate", generate)
     graph.add_node("validate", validate)
+    graph.add_node("check_query", check_query)
     graph.add_node("execute", execute)
     graph.add_node("repair", repair)
     graph.add_edge(START, "schema")
-    graph.add_edge("schema", "generate")
+    graph.add_edge("schema", "inspect_schema")
+    graph.add_edge("inspect_schema", "generate")
     graph.add_edge("generate", "validate")
     graph.add_conditional_edges(
-        "validate", after_validation, {"execute": "execute", "repair": "repair", "end": END}
+        "validate", after_validation, {"check_query": "check_query", "repair": "repair", "end": END}
     )
-    graph.add_conditional_edges("execute", after_execution, {"repair": "repair", "end": END})
+    graph.add_conditional_edges(
+        "check_query", after_query_check, {"execute": "execute", "repair": "repair", "end": END}
+    )
+    graph.add_conditional_edges("execute", repair_or_end, {"repair": "repair", "end": END})
     graph.add_edge("repair", "validate")
     return graph.compile()
 

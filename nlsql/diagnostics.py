@@ -12,6 +12,7 @@ from data_connect_hub import (
     DCHValidationError,
 )
 from openai import APIError
+from pyarrow import flight
 from sqlglot.errors import SqlglotError
 
 
@@ -104,12 +105,17 @@ def validation_error_hint(error: Exception) -> str:
     return "DCH rejected the request. Check required credential fields, tenant configuration, and DCH service logs."
 
 
-def connection_error_hint(error: Exception) -> str:
+def _exception_chain(error: Exception) -> list[Exception]:
     chain, seen, current = [], set(), error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         chain.append(current)
         current = current.__cause__ or current.__context__
+    return chain
+
+
+def connection_error_hint(error: Exception) -> str:
+    chain = _exception_chain(error)
     message = " ".join(str(item) for item in chain).lower()
     if "failed to obtain credentials" in message:
         return (
@@ -127,6 +133,20 @@ def connection_error_hint(error: Exception) -> str:
             "TLS certificate verification failed. Set DCH_CA_CERT to a trusted CA bundle "
             "for the DCH gateway (not the PostgreSQL server)."
         )
+    if any(isinstance(item, flight.FlightUnauthenticatedError) for item in chain) or any(
+        text in message for text in ("unauthenticated", "token has expired", "token is expired")
+    ):
+        return (
+            "DCH Flight authentication failed. Refresh DCH_TOKEN and confirm that the "
+            "gateway accepts it for Flight as well as REST."
+        )
+    if any(isinstance(item, flight.FlightUnauthorizedError) for item in chain) or any(
+        text in message for text in ("permission denied", "permission_denied", "forbidden")
+    ):
+        return (
+            "DCH Flight access was denied. Check tenant permissions, service-account access "
+            "to the credential Secret, and source database permissions."
+        )
     if any(isinstance(item, socket.gaierror) for item in chain) or any(
         text in message
         for text in ("getaddrinfo", "nodename nor servname", "name or service not known")
@@ -134,6 +154,39 @@ def connection_error_hint(error: Exception) -> str:
         return "DNS lookup failed. Check DCH_HOST and your VPN/DNS connection."
     if "connection refused" in message:
         return "The gateway refused the connection. Check DCH_HOST, its port, and gateway availability."
-    if "timed out" in message or "timeout" in message:
+    if any(isinstance(item, flight.FlightTimedOutError) for item in chain) or any(
+        text in message for text in ("timed out", "timeout", "deadline exceeded")
+    ):
         return "The gateway connection timed out. Check routing, firewall, proxy, and VPN access."
-    return "Check DCH_HOST, gateway routing, proxy/VPN access, and TLS configuration."
+    if any(
+        isinstance(item, (ConnectionResetError, ConnectionAbortedError)) for item in chain
+    ) or any(
+        text in message
+        for text in ("connection reset", "unexpected eof", "stream removed", "goaway")
+    ):
+        return (
+            "The DCH connection was interrupted. Retry this check; if it repeats, check "
+            "gateway/proxy connection handling, VPN access, and Flight service health."
+        )
+    if any(isinstance(item, flight.FlightUnavailableError) for item in chain) or any(
+        text in message for text in ("no healthy upstream", "statuscode.unavailable")
+    ):
+        return (
+            "DCH Flight is unavailable. Retry this check; if it persists, check gateway "
+            "routing and Flight service health. REST connection status may still be ready."
+        )
+    if any(isinstance(item, flight.FlightInternalError) for item in chain):
+        return (
+            "DCH Flight returned an internal error. Check the Flight service logs for this "
+            "operation; REST connection status may still be ready."
+        )
+    if "server returned no flight endpoints" in message:
+        return (
+            "DCH Flight returned no metadata endpoint. Check Flight service health and "
+            "SDK/server compatibility."
+        )
+    cause = type(chain[-1]).__name__
+    return (
+        f"DCH connection failed ({cause}). Check DCH_HOST, gateway routing, proxy/VPN access, "
+        "and TLS configuration. If it persists, check DCH Flight logs for this operation."
+    )
